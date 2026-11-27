@@ -1,3 +1,4 @@
+use crate::snapshot::Store;
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -7,10 +8,13 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
+    io,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use tokio::sync::Semaphore;
 
 const LEASE_DURATION: Duration = Duration::from_secs(100);
 const MAX_ATTEMPTS: u8 = 3;
@@ -25,6 +29,12 @@ pub struct Request {
 }
 
 impl Request {
+    fn valid(&self) -> bool {
+        !self.prompt.trim().is_empty() && self.prompt.len() <= 64 * 1024
+            && (1..=32_768).contains(&self.prompt_tokens)
+            && (1..=4_096).contains(&self.max_tokens)
+    }
+
     fn token_budget(&self) -> u64 {
         u64::from(self.prompt_tokens) + u64::from(self.max_tokens)
     }
@@ -50,28 +60,28 @@ pub struct Finish {
     pub outcome: Outcome,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum Phase {
     Pending,
     Running {
-        #[serde(skip)]
         lease_id: u64,
-        #[serde(skip)]
+        #[serde(skip, default = "Instant::now")]
         expires: Instant,
     },
     Done { output: String },
     Failed,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 struct Job {
     request: Request,
     phase: Phase,
     attempts: u8,
 }
 
-#[derive(Default)]
-struct Queue {
+#[derive(Clone, Default, Deserialize, Serialize)]
+pub(crate) struct Queue {
     jobs: HashMap<u64, Job>,
     pending: VecDeque<u64>,
     history: VecDeque<u64>,
@@ -82,14 +92,53 @@ struct Queue {
 }
 
 impl Queue {
-    fn expire(&mut self) {
-        let now = Instant::now();
-        let expired: Vec<u64> = self.jobs.iter().filter_map(|(&id, job)| {
+    fn expired(&self, now: Instant) -> impl Iterator<Item = u64> + '_ {
+        self.jobs.iter().filter_map(move |(&id, job)| {
             matches!(&job.phase, Phase::Running { expires, .. } if *expires <= now).then_some(id)
-        }).collect();
+        })
+    }
+
+    fn expire(&mut self, now: Instant) -> bool {
+        let mut expired: Vec<u64> = self.expired(now).collect();
+        expired.sort_unstable();
+        let changed = !expired.is_empty();
         for id in expired {
             self.retry(id);
         }
+        changed
+    }
+
+    pub(crate) fn validate_snapshot(&self) -> io::Result<()> {
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "inconsistent queue snapshot");
+        let pending: HashSet<_> = self.pending.iter().copied().collect();
+        let history: HashSet<_> = self.history.iter().copied().collect();
+        if pending.len() != self.pending.len() || history.len() != self.history.len()
+            || !pending.is_disjoint(&history) || history.len() > HISTORY_LIMIT
+            || pending.union(&history).any(|id| !self.jobs.contains_key(id))
+            || self.jobs.len() - history.len() > ACTIVE_LIMIT
+            || self.completed.saturating_add(self.failed) > self.job_id
+        {
+            return Err(invalid());
+        }
+        let mut leases = HashSet::new();
+        for (&id, job) in &self.jobs {
+            if id == 0 || id > self.job_id || !job.request.valid() || job.attempts > MAX_ATTEMPTS {
+                return Err(invalid());
+            }
+            let valid = match &job.phase {
+                Phase::Pending => pending.contains(&id) && job.attempts < MAX_ATTEMPTS,
+                Phase::Running { lease_id, .. } => !pending.contains(&id) && !history.contains(&id)
+                    && job.attempts > 0 && *lease_id > 0 && *lease_id <= self.lease_id
+                    && leases.insert(*lease_id),
+                Phase::Done { output } => history.contains(&id) && output.len() <= 64 * 1024
+                    && job.attempts > 0,
+                Phase::Failed => history.contains(&id) && job.attempts == MAX_ATTEMPTS,
+            };
+            if !valid {
+                return Err(invalid());
+            }
+        }
+        Ok(())
     }
 
     fn retain_result(&mut self, id: u64) {
@@ -113,87 +162,237 @@ impl Queue {
     }
 }
 
-type Shared = Arc<Mutex<Queue>>;
+struct Broker {
+    queue: Queue,
+    store: Option<Store>,
+    sync_failed: bool,
+}
 
-pub fn router() -> Router {
-    Router::new()
-        .route("/healthz", get(|| async { StatusCode::OK }))
+impl Broker {
+    fn open(path: Option<PathBuf>) -> io::Result<Self> {
+        let Some(path) = path else {
+            return Ok(Self { queue: Queue::default(), store: None, sync_failed: false });
+        };
+        let (store, mut queue) = Store::open(path)?;
+        if queue.expire(Instant::now()) {
+            store.save(&queue).map_err(|error| error.source)?;
+        }
+        Ok(Self { queue, store: Some(store), sync_failed: false })
+    }
+
+    fn available(&self) -> io::Result<()> {
+        if self.sync_failed {
+            return Err(io::Error::other("queue state sync failed after replacement, restart required"));
+        }
+        Ok(())
+    }
+
+    fn update<T>(&mut self, op: impl FnOnce(&mut Queue) -> T) -> Result<T, QueueError> {
+        let Some(store) = &self.store else {
+            return Ok(op(&mut self.queue));
+        };
+        let mut next = self.queue.clone();
+        let response = op(&mut next);
+        if let Err(error) = store.save(&next) {
+            if error.replaced {
+                // The rename is visible, but its persistence is uncertain. Stop
+                // serving until restart to avoid diverging from the snapshot.
+                self.sync_failed = true;
+                return Err(QueueError::CommitOutcomeUnknown(error.source));
+            }
+            return Err(error.source.into());
+        }
+        self.queue = next;
+        Ok(response)
+    }
+
+    fn expire(&mut self) -> Result<(), QueueError> {
+        let now = Instant::now();
+        if self.queue.expired(now).next().is_some() {
+            self.update(|queue| queue.expire(now))?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct Shared {
+    broker: Arc<Mutex<Broker>>,
+    admission: Option<Arc<Semaphore>>,
+}
+
+enum QueueError {
+    Busy,
+    Storage(io::Error),
+    CommitOutcomeUnknown(io::Error),
+}
+
+impl From<io::Error> for QueueError {
+    fn from(error: io::Error) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl IntoResponse for QueueError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Busy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "1")],
+                "queue storage busy",
+            ).into_response(),
+            Self::Storage(error) => {
+                eprintln!("queue operation failed: {error}");
+                (StatusCode::SERVICE_UNAVAILABLE, "queue storage unavailable").into_response()
+            }
+            Self::CommitOutcomeUnknown(error) => {
+                eprintln!("snapshot replaced but directory sync failed: {error}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "queue_commit_outcome_unknown",
+                        "message": "The queue change may have been applied. Do not retry blindly."
+                    })),
+                ).into_response()
+            }
+        }
+    }
+}
+
+async fn access<T: Send + 'static>(
+    shared: Shared,
+    op: impl FnOnce(&mut Broker) -> Result<T, QueueError> + Send + 'static,
+) -> Result<T, QueueError> {
+    let Shared { broker, admission } = shared;
+    let op = move || {
+        let mut broker = broker.lock().map_err(|_| io::Error::other("queue lock poisoned"))?;
+        broker.available()?;
+        op(&mut broker)
+    };
+    if let Some(admission) = admission {
+        let permit = admission.try_acquire_owned().map_err(|_| QueueError::Busy)?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            op()
+        }).await.map_err(io::Error::other)?
+    } else {
+        op()
+    }
+}
+
+pub fn router(path: Option<PathBuf>) -> io::Result<Router> {
+    let admission = path.is_some().then(|| Arc::new(Semaphore::new(1)));
+    let broker = Broker::open(path.clone()).map_err(|error| {
+        if let Some(path) = path {
+            return io::Error::new(error.kind(), format!("open queue state {}: {error}", path.display()));
+        }
+        error
+    })?;
+    let state = Shared { broker: Arc::new(Mutex::new(broker)), admission };
+    Ok(Router::new()
+        .route("/healthz", get(health))
         .route("/metrics", get(metrics))
         .route("/jobs", post(submit))
         .route("/jobs/{id}", get(status))
         .route("/claim", post(claim))
         .route("/jobs/{id}/finish", post(finish))
-        .with_state(Shared::default())
+        .with_state(state))
 }
 
-async fn submit(State(shared): State<Shared>, Json(request): Json<Request>) -> Response {
-    if request.prompt.trim().is_empty() || request.prompt.len() > 64 * 1024
-        || !(1..=32_768).contains(&request.prompt_tokens)
-        || !(1..=4_096).contains(&request.max_tokens)
-    {
-        return (StatusCode::BAD_REQUEST, "invalid prompt or token budget").into_response();
-    }
-    let mut queue = shared.lock().expect("queue lock");
-    if queue.jobs.len() - queue.history.len() >= ACTIVE_LIMIT {
-        return (StatusCode::TOO_MANY_REQUESTS, "queue full").into_response();
-    }
-    queue.job_id += 1;
-    let id = queue.job_id;
-    queue.jobs.insert(id, Job { request, phase: Phase::Pending, attempts: 0 });
-    queue.pending.push_back(id);
-    (StatusCode::ACCEPTED, Json(serde_json::json!({ "job_id": id }))).into_response()
+async fn health(State(shared): State<Shared>) -> Result<StatusCode, QueueError> {
+    access(shared, |_| Ok(StatusCode::OK)).await
 }
 
-async fn status(State(shared): State<Shared>, Path(id): Path<u64>) -> Response {
-    let mut queue = shared.lock().expect("queue lock");
-    queue.expire();
-    match queue.jobs.get(&id) {
-        Some(job) => Json(&job.phase).into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+async fn submit(
+    State(shared): State<Shared>,
+    Json(request): Json<Request>,
+) -> Result<Response, QueueError> {
+    if !request.valid() {
+        return Ok((StatusCode::BAD_REQUEST, "invalid prompt or token budget").into_response());
     }
+    access(shared, move |broker| {
+        if broker.queue.jobs.len() - broker.queue.history.len() >= ACTIVE_LIMIT {
+            return Ok((StatusCode::TOO_MANY_REQUESTS, "queue full").into_response());
+        }
+        let id = broker.queue.job_id.checked_add(1)
+            .ok_or_else(|| io::Error::other("job IDs exhausted"))?;
+        broker.update(|queue| {
+            queue.job_id = id;
+            queue.jobs.insert(id, Job { request, phase: Phase::Pending, attempts: 0 });
+            queue.pending.push_back(id);
+        })?;
+        Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "job_id": id }))).into_response())
+    }).await
 }
 
-async fn claim(State(shared): State<Shared>) -> Json<Option<Lease>> {
-    let mut queue = shared.lock().expect("queue lock");
-    queue.expire();
-    let Some(job_id) = queue.pending.pop_front() else {
-        return Json(None);
-    };
-    queue.lease_id += 1;
-    let lease_id = queue.lease_id;
-    let job = queue.jobs.get_mut(&job_id).expect("pending job exists");
-    job.attempts += 1;
-    job.phase = Phase::Running { lease_id, expires: Instant::now() + LEASE_DURATION };
-    Json(Some(Lease { job_id, lease_id, request: job.request.clone() }))
+async fn status(
+    State(shared): State<Shared>, Path(id): Path<u64>,
+) -> Result<Response, QueueError> {
+    access(shared, move |broker| {
+        broker.expire()?;
+        let response = match broker.queue.jobs.get(&id).map(|job| &job.phase) {
+            Some(Phase::Running { .. }) => Json(serde_json::json!({ "status": "running" })).into_response(),
+            Some(phase) => Json(phase).into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+        Ok(response)
+    }).await
+}
+
+async fn claim(State(shared): State<Shared>) -> Result<Json<Option<Lease>>, QueueError> {
+    access(shared, |broker| {
+        broker.expire()?;
+        let Some(&job_id) = broker.queue.pending.front() else {
+            return Ok(Json(None));
+        };
+        let lease_id = broker.queue.lease_id.checked_add(1)
+            .ok_or_else(|| io::Error::other("lease IDs exhausted"))?;
+        let lease = broker.update(|queue| {
+            queue.pending.pop_front();
+            queue.lease_id = lease_id;
+            let job = queue.jobs.get_mut(&job_id).expect("pending job exists");
+            job.attempts += 1;
+            job.phase = Phase::Running { lease_id, expires: Instant::now() + LEASE_DURATION };
+            Lease { job_id, lease_id, request: job.request.clone() }
+        })?;
+        Ok(Json(Some(lease)))
+    }).await
 }
 
 async fn finish(
     State(shared): State<Shared>,
     Path(id): Path<u64>,
     Json(finish): Json<Finish>,
-) -> StatusCode {
-    let mut queue = shared.lock().expect("queue lock");
-    queue.expire();
-    let Some(job) = queue.jobs.get_mut(&id) else {
-        return StatusCode::NOT_FOUND;
-    };
-    if !matches!(&job.phase, Phase::Running { lease_id, .. } if *lease_id == finish.lease_id) {
-        return StatusCode::CONFLICT;
-    }
-    match finish.outcome {
-        Outcome::Done { output } if output.len() <= 64 * 1024 => {
-            job.phase = Phase::Done { output };
-            queue.completed += 1;
-            queue.retain_result(id);
+) -> Result<StatusCode, QueueError> {
+    access(shared, move |broker| {
+        broker.expire()?;
+        let Some(job) = broker.queue.jobs.get(&id) else {
+            return Ok(StatusCode::NOT_FOUND);
+        };
+        if !matches!(&job.phase, Phase::Running { lease_id, .. } if *lease_id == finish.lease_id) {
+            return Ok(StatusCode::CONFLICT);
         }
-        _ => queue.retry(id),
-    }
-    StatusCode::NO_CONTENT
+        broker.update(|queue| match finish.outcome {
+            Outcome::Done { output } if output.len() <= 64 * 1024 => {
+                let job = queue.jobs.get_mut(&id).expect("leased job exists");
+                job.phase = Phase::Done { output };
+                queue.completed += 1;
+                queue.retain_result(id);
+            }
+            _ => queue.retry(id),
+        })?;
+        Ok(StatusCode::NO_CONTENT)
+    }).await
 }
 
-async fn metrics(State(shared): State<Shared>) -> impl IntoResponse {
-    let mut queue = shared.lock().expect("queue lock");
-    queue.expire();
+async fn metrics(State(shared): State<Shared>) -> Result<Response, QueueError> {
+    access(shared, |broker| {
+        broker.expire()?;
+        Ok(render_metrics(&broker.queue).into_response())
+    }).await
+}
+
+fn render_metrics(queue: &Queue) -> impl IntoResponse {
     let mut pending = 0;
     let mut inflight = 0;
     for job in queue.jobs.values() {

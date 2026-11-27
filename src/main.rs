@@ -1,4 +1,5 @@
 mod queue;
+mod snapshot;
 mod worker;
 
 use std::{error::Error, net::SocketAddr};
@@ -15,6 +16,7 @@ async fn main() -> Result<()> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "demo".to_owned());
     match mode.as_str() {
         "demo" | "queue" => {
+            let app = queue::router(std::env::var_os("QUEUE_STATE_FILE").map(Into::into))?;
             let listen: SocketAddr = setting("QUEUE_LISTEN", "127.0.0.1:8080").parse()?;
             let listener = TcpListener::bind(listen).await?;
             let bound = listener.local_addr()?;
@@ -24,7 +26,7 @@ async fn main() -> Result<()> {
                 let url = format!("http://127.0.0.1:{}", bound.port());
                 tokio::spawn(worker::run(url, None, stop_rx))
             });
-            axum::serve(listener, queue::router())
+            axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     signal().await;
                     let _ = stop.send(true);
