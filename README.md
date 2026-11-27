@@ -27,6 +27,8 @@ QUEUE_URL=http://127.0.0.1:8080 \
 
 Set `INFERENCE_API_KEY` if the upstream requires authentication. On SIGTERM the worker stops taking leases, finishes its active job, and sends the result to the queue. If the worker dies, the lease expires after 100 seconds and the broker requeues the job for up to three total attempts. The broker requires the active lease ID when accepting a result, so a worker with an expired lease cannot complete a reassigned job.
 
+During drain and normal operation, the worker retries the same finish payload on connection failures and transient HTTP responses, including a busy `503`. It honors `Retry-After` in seconds and spends at most 20 seconds acknowledging a result, bounded by its remaining lease time. A `409` ends the acknowledgement attempt. When a finish response is lost after the broker applied the result, replaying the same lease and outcome returns `204` without changing job state or counters. A different outcome or output conflicts. Retry receipts are cleared on reassignment, and completion receipts last as long as the retained result (the latest 128 terminal jobs).
+
 ## Persist the queue
 
 On macOS or Linux, set `QUEUE_STATE_FILE` to keep queue state across broker restarts. Its parent directory must already exist and be writable by the broker.
@@ -42,7 +44,7 @@ Only one broker can open a state file. Keep the directory private because snapsh
 
 The durable broker admits one request at a time. Requests rejected while it is busy return HTTP 503 with `Retry-After: 1` before touching the queue. A write failure before rename returns HTTP 503 and leaves the committed state intact.
 
-If directory sync fails after rename, the request returns HTTP 500 with the error code `queue_commit_outcome_unknown`. The change may already be in the snapshot. The broker stops processing queue requests until restart. A client timeout can also leave the outcome unknown if the broker has started the mutation. Reconcile either outcome before resubmitting because submissions do not carry idempotency keys.
+If directory sync fails after rename, the request returns HTTP 500 with the error code `queue_commit_outcome_unknown`. The change may already be in the snapshot. The broker stops processing queue requests until restart. A client timeout can also leave the outcome unknown if the broker has started the mutation. Finish receipts survive restart, so a worker can replay a committed acknowledgement without running inference again. Reconcile unknown submit outcomes before resubmitting because submissions do not carry idempotency keys.
 
 ## Kubernetes deployment
 
