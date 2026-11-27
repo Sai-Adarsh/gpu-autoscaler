@@ -77,6 +77,35 @@ fn expires_jobs_in_stable_order_and_retains_only_the_recent_terminal_history() {
     assert_eq!(queue.failed, 1 + HISTORY_LIMIT as u64);
 }
 
+#[cfg(unix)]
+#[test]
+fn rejects_snapshots_with_inconsistent_job_counters() {
+    let dir = StateDir::new();
+    let snapshot = dir.snapshot();
+    let mut job = running(1, 1, Instant::now());
+    job.phase = Phase::Done { output: "fixture".into() };
+    let mut queue = Queue {
+        jobs: [(1, job)].into(),
+        history: [1].into(),
+        job_id: 1,
+        lease_id: 1,
+        completed: 1,
+        ..Queue::default()
+    };
+    fs::write(&snapshot, serde_json::json!({"version": 1, "queue": queue}).to_string()).unwrap();
+    assert!(Broker::open(Some(snapshot.clone())).is_ok());
+
+    for (job_id, completed, failed) in [(1, 0, 1), (2, 1, 0), (u64::MAX, u64::MAX, 1)] {
+        queue.job_id = job_id;
+        queue.completed = completed;
+        queue.failed = failed;
+        fs::write(&snapshot, serde_json::json!({"version": 1, "queue": queue}).to_string()).unwrap();
+        let error = Broker::open(Some(snapshot.clone())).err()
+            .expect("inconsistent counters must prevent startup");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+}
+
 #[test]
 fn rejects_malformed_and_incompatible_persisted_state() {
     let dir = StateDir::new();

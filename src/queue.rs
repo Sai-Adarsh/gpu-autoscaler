@@ -147,11 +147,17 @@ impl Queue {
         if pending.len() != self.pending.len() || history.len() != self.history.len()
             || !pending.is_disjoint(&history) || history.len() > HISTORY_LIMIT
             || pending.union(&history).any(|id| !self.jobs.contains_key(id))
-            || self.jobs.len() - history.len() > ACTIVE_LIMIT
-            || self.completed.saturating_add(self.failed) > self.job_id
         {
             return Err(invalid());
         }
+        let active = self.jobs.len() - history.len();
+        // Every accepted job is active or counted once as terminal, even after history eviction.
+        let accounted = self.completed.checked_add(self.failed)
+            .and_then(|terminal| terminal.checked_add(active as u64));
+        if active > ACTIVE_LIMIT || accounted != Some(self.job_id) {
+            return Err(invalid());
+        }
+        let mut retained_completed = 0;
         let mut leases = HashSet::new();
         let mut idempotency_keys = HashSet::new();
         for (&id, job) in &self.jobs {
@@ -163,8 +169,10 @@ impl Queue {
                 Phase::Running { lease_id, .. } => !pending.contains(&id) && !history.contains(&id)
                     && job.attempts > 0 && *lease_id > 0 && *lease_id <= self.lease_id
                     && leases.insert(*lease_id),
-                Phase::Done { output } => history.contains(&id) && output.len() <= MAX_OUTPUT_BYTES
-                    && job.attempts > 0,
+                Phase::Done { output } => {
+                    retained_completed += 1;
+                    history.contains(&id) && output.len() <= MAX_OUTPUT_BYTES && job.attempts > 0
+                }
                 Phase::Failed => history.contains(&id) && job.attempts == MAX_ATTEMPTS,
             };
             let receipt_valid = job.last_finish.as_ref().is_none_or(|receipt| {
@@ -183,6 +191,10 @@ impl Queue {
             if !valid || !receipt_valid || !key_valid {
                 return Err(invalid());
             }
+        }
+        let retained_failed = history.len() as u64 - retained_completed;
+        if retained_completed > self.completed || retained_failed > self.failed {
+            return Err(invalid());
         }
         Ok(())
     }
