@@ -273,6 +273,87 @@ async fn restarts_recover_jobs_and_fence_old_leases() {
 }
 
 #[tokio::test]
+async fn replays_submission_after_restart_without_queuing_twice() {
+    let files = Files::new();
+    let snapshot = files.0.join("state.json");
+    let state = snapshot.to_str().unwrap();
+    let broker = Broker::new();
+    let queue = broker.start("queue", Some(state)).await;
+    let request = json!({"prompt":"complete once", "prompt_tokens":9, "max_tokens":15});
+    let submit = |key: &'static str, body: Value| {
+        broker
+            .client
+            .post(format!("{}/jobs", broker.base))
+            .header("idempotency-key", key)
+            .json(&body)
+            .send()
+    };
+    let response = submit("checkout-123", request.clone()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let first = response.json::<Value>().await.unwrap();
+    drop(queue);
+
+    let _restarted = broker.start("queue", Some(state)).await;
+    let response = submit("checkout-123", request.clone()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.json::<Value>().await.unwrap(), first);
+    let mut different = request.clone();
+    different["max_tokens"] = json!(16);
+    assert_eq!(
+        submit("checkout-123", different).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        submit("contains space", request.clone())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let lease = broker
+        .post("/claim", Value::Null)
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(lease["job_id"], first["job_id"]);
+    assert!(
+        broker
+            .post("/claim", Value::Null)
+            .await
+            .json::<Value>()
+            .await
+            .unwrap()
+            .is_null()
+    );
+    let path = format!("/jobs/{}/finish", first["job_id"]);
+    let done = json!({"lease_id":lease["lease_id"],"outcome":{"status":"done","output":"once"}});
+    assert_eq!(
+        broker.post(&path, done).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        submit("checkout-123", request)
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap(),
+        first
+    );
+    assert!(
+        broker
+            .get("/metrics")
+            .await
+            .text()
+            .await
+            .unwrap()
+            .contains("inference_completed_total 1")
+    );
+}
+
+#[tokio::test]
 async fn worker_retries_one_output_through_busy_and_uncertain_acknowledgments() {
     let files = Files::new();
     let snapshot = files.0.join("state.json");

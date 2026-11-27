@@ -5,7 +5,7 @@ mod tests;
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -25,7 +25,7 @@ const MAX_ATTEMPTS: u8 = 3;
 const ACTIVE_LIMIT: usize = 2_048;
 const HISTORY_LIMIT: usize = 128;
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 pub struct Request {
     pub prompt: String,
     pub prompt_tokens: u32,
@@ -84,6 +84,8 @@ struct Job {
     attempts: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_finish: Option<FinishReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -151,6 +153,7 @@ impl Queue {
             return Err(invalid());
         }
         let mut leases = HashSet::new();
+        let mut idempotency_keys = HashSet::new();
         for (&id, job) in &self.jobs {
             if id == 0 || id > self.job_id || !job.request.valid() || job.attempts > MAX_ATTEMPTS {
                 return Err(invalid());
@@ -174,7 +177,10 @@ impl Queue {
                         Phase::Running { .. } => false,
                     }
             });
-            if !valid || !receipt_valid {
+            let key_valid = job.idempotency_key.as_deref().is_none_or(|key| {
+                valid_idempotency_key(key) && idempotency_keys.insert(key)
+            });
+            if !valid || !receipt_valid || !key_valid {
                 return Err(invalid());
             }
         }
@@ -345,12 +351,29 @@ async fn health(State(shared): State<Shared>) -> Result<StatusCode, QueueError> 
 
 async fn submit(
     State(shared): State<Shared>,
+    headers: HeaderMap,
     Json(request): Json<Request>,
 ) -> Result<Response, QueueError> {
     if !request.valid() {
         return Ok((StatusCode::BAD_REQUEST, "invalid prompt or token budget").into_response());
     }
+    let mut keys = headers.get_all("idempotency-key").iter();
+    let idempotency_key = match (keys.next().map(|header| header.to_str()), keys.next()) {
+        (None, _) => None,
+        (Some(Ok(key)), None) if valid_idempotency_key(key) => Some(key.to_owned()),
+        _ => return Ok((StatusCode::BAD_REQUEST, "invalid Idempotency-Key").into_response()),
+    };
     access(shared, move |broker| {
+        if let Some(key) = idempotency_key.as_ref() {
+            if let Some((&id, job)) = broker.queue.jobs.iter().find(|(_, job)| {
+                job.idempotency_key.as_ref() == Some(key)
+            }) {
+                if job.request != request {
+                    return Ok((StatusCode::CONFLICT, "Idempotency-Key is already assigned to another request").into_response());
+                }
+                return Ok(accepted_job(id));
+            }
+        }
         if broker.queue.jobs.len() - broker.queue.history.len() >= ACTIVE_LIMIT {
             return Ok((StatusCode::TOO_MANY_REQUESTS, "queue full").into_response());
         }
@@ -358,11 +381,26 @@ async fn submit(
             .ok_or_else(|| io::Error::other("job IDs exhausted"))?;
         broker.update(|queue| {
             queue.job_id = id;
-            queue.jobs.insert(id, Job { request, phase: Phase::Pending, attempts: 0, last_finish: None });
+            queue.jobs.insert(id, Job {
+                request,
+                phase: Phase::Pending,
+                attempts: 0,
+                last_finish: None,
+                idempotency_key,
+            });
             queue.pending.push_back(id);
         })?;
-        Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "job_id": id }))).into_response())
+        Ok(accepted_job(id))
     }).await
+}
+
+fn accepted_job(id: u64) -> Response {
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "job_id": id }))).into_response()
+}
+
+fn valid_idempotency_key(key: &str) -> bool {
+    (1..=128).contains(&key.len())
+        && key.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
 }
 
 async fn status(
