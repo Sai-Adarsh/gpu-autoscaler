@@ -233,6 +233,7 @@ name = "gpu-autoscaler"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

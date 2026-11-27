@@ -27,6 +27,23 @@ QUEUE_URL=http://127.0.0.1:8080 \
 
 Set `INFERENCE_API_KEY` if the upstream requires authentication. On SIGTERM the worker stops taking leases, finishes its active job, and sends the result to the queue. If the worker dies, the lease expires after 100 seconds and the broker requeues the job for up to three total attempts. The broker requires the active lease ID when accepting a result, so a worker with an expired lease cannot complete a reassigned job.
 
+## Persist the queue
+
+On macOS or Linux, set `QUEUE_STATE_FILE` to keep queue state across broker restarts. Its parent directory must already exist and be writable by the broker.
+
+```sh
+mkdir -p "$HOME/.local/state/gpu-autoscaler"
+QUEUE_STATE_FILE="$HOME/.local/state/gpu-autoscaler/queue.json" cargo run --locked -- queue
+```
+
+The broker syncs a replacement snapshot before acknowledging each change. A restart preserves queued jobs, retained results, metrics counters, and the next IDs. It expires outstanding leases and requeues those jobs under the existing retry limit. Delivery is at least once. A worker may still finish inference for a job that another worker receives after restart. The broker returns HTTP 409 for an acknowledgement under the old lease while it retains that job.
+
+Only one broker can open a state file. Keep the directory private because snapshots contain prompts and completions. The broker reserves the sibling files with `.lock` and `.tmp` suffixes and removes any leftover temporary file after acquiring the lock. Use a filesystem that supports advisory locks, atomic renames, and directory sync. The broker refuses to start with an unreadable or inconsistent snapshot.
+
+The durable broker admits one request at a time. Requests rejected while it is busy return HTTP 503 with `Retry-After: 1` before touching the queue. A write failure before rename returns HTTP 503 and leaves the committed state intact.
+
+If directory sync fails after rename, the request returns HTTP 500 with the error code `queue_commit_outcome_unknown`. The change may already be in the snapshot. The broker stops processing queue requests until restart. A client timeout can also leave the outcome unknown if the broker has started the mutation. Reconcile either outcome before resubmitting because submissions do not carry idempotency keys.
+
 ## Kubernetes deployment
 
 Use Kubernetes 1.33 or later, native sidecars, KEDA, and the NVIDIA device plugin. On EKS, create an EC2NodeClass named `gpu-nvidia` with an NVIDIA-enabled image, IAM role, subnets, and security groups. Configure the device plugin to tolerate the GPU pool taint. The NodePool restricts workers to Spot instances. [Kubernetes sidecars](https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/) · [KEDA Prometheus scaler](https://keda.sh/docs/2.19/scalers/prometheus/) · [Karpenter NodePools](https://karpenter.sh/docs/concepts/nodepools/)
@@ -45,4 +62,4 @@ Submit jobs through the forwarded queue. Watch `kubectl -n inference get scaledo
 
 Leased tokens keep the metric above zero until the last job completes. The GPU sidecar stays up while its Rust worker drains. Spot termination can interrupt the pod before its grace period ends, in which case the broker retries when the lease expires.
 
-The broker keeps jobs and measurements in memory on a single replica. Use authenticated ingress for external access and durable storage if jobs must survive broker restart. Cluster scaling and billing remain unmeasured.
+The manifests default to one broker replica with in-memory state. To opt into persistence, mount a dedicated writable PVC on the broker Deployment and set `QUEUE_STATE_FILE` to a file on that volume. Keep the `Recreate` strategy and a single broker replica. This snapshot store rewrites the bounded queue on each change and does not provide high availability. Use authenticated ingress for external access. Cluster scaling and billing remain unmeasured.
