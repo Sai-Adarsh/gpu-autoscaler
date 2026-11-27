@@ -9,6 +9,10 @@ use std::{
 
 const VERSION: u32 = 1;
 
+#[cfg(all(test, unix))]
+#[path = "../tests/unit/snapshot.rs"]
+pub(crate) mod tests;
+
 #[derive(Deserialize)]
 struct Snapshot {
     version: u32,

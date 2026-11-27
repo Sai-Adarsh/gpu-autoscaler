@@ -1,4 +1,7 @@
 use crate::snapshot::Store;
+#[cfg(test)]
+#[path = "../tests/unit/queue.rs"]
+mod tests;
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -16,7 +19,8 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
-const LEASE_DURATION: Duration = Duration::from_secs(100);
+pub(crate) const LEASE_DURATION: Duration = Duration::from_secs(100);
+pub(crate) const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_ATTEMPTS: u8 = 3;
 const ACTIVE_LIMIT: usize = 2_048;
 const HISTORY_LIMIT: usize = 128;
@@ -78,6 +82,32 @@ struct Job {
     request: Request,
     phase: Phase,
     attempts: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_finish: Option<FinishReceipt>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct FinishReceipt {
+    lease_id: u64,
+    done: bool,
+}
+
+impl Job {
+    fn acknowledges(&self, finish: &Finish) -> bool {
+        let Some(receipt) = &self.last_finish else {
+            return false;
+        };
+        if receipt.lease_id != finish.lease_id {
+            return false;
+        }
+        match (&self.phase, &finish.outcome) {
+            (Phase::Done { output }, Outcome::Done { output: requested }) => {
+                receipt.done && output == requested
+            }
+            (Phase::Pending | Phase::Failed, Outcome::Retry) => !receipt.done,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -130,11 +160,21 @@ impl Queue {
                 Phase::Running { lease_id, .. } => !pending.contains(&id) && !history.contains(&id)
                     && job.attempts > 0 && *lease_id > 0 && *lease_id <= self.lease_id
                     && leases.insert(*lease_id),
-                Phase::Done { output } => history.contains(&id) && output.len() <= 64 * 1024
+                Phase::Done { output } => history.contains(&id) && output.len() <= MAX_OUTPUT_BYTES
                     && job.attempts > 0,
                 Phase::Failed => history.contains(&id) && job.attempts == MAX_ATTEMPTS,
             };
-            if !valid {
+            let receipt_valid = job.last_finish.as_ref().is_none_or(|receipt| {
+                job.attempts > 0
+                    && receipt.lease_id > 0 && receipt.lease_id <= self.lease_id
+                    && leases.insert(receipt.lease_id)
+                    && match job.phase {
+                        Phase::Done { .. } => receipt.done,
+                        Phase::Pending | Phase::Failed => !receipt.done,
+                        Phase::Running { .. } => false,
+                    }
+            });
+            if !valid || !receipt_valid {
                 return Err(invalid());
             }
         }
@@ -318,7 +358,7 @@ async fn submit(
             .ok_or_else(|| io::Error::other("job IDs exhausted"))?;
         broker.update(|queue| {
             queue.job_id = id;
-            queue.jobs.insert(id, Job { request, phase: Phase::Pending, attempts: 0 });
+            queue.jobs.insert(id, Job { request, phase: Phase::Pending, attempts: 0, last_finish: None });
             queue.pending.push_back(id);
         })?;
         Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "job_id": id }))).into_response())
@@ -352,6 +392,7 @@ async fn claim(State(shared): State<Shared>) -> Result<Json<Option<Lease>>, Queu
             queue.lease_id = lease_id;
             let job = queue.jobs.get_mut(&job_id).expect("pending job exists");
             job.attempts += 1;
+            job.last_finish = None;
             job.phase = Phase::Running { lease_id, expires: Instant::now() + LEASE_DURATION };
             Lease { job_id, lease_id, request: job.request.clone() }
         })?;
@@ -369,17 +410,29 @@ async fn finish(
         let Some(job) = broker.queue.jobs.get(&id) else {
             return Ok(StatusCode::NOT_FOUND);
         };
+        if job.acknowledges(&finish) {
+            return Ok(StatusCode::NO_CONTENT);
+        }
         if !matches!(&job.phase, Phase::Running { lease_id, .. } if *lease_id == finish.lease_id) {
             return Ok(StatusCode::CONFLICT);
         }
-        broker.update(|queue| match finish.outcome {
-            Outcome::Done { output } if output.len() <= 64 * 1024 => {
-                let job = queue.jobs.get_mut(&id).expect("leased job exists");
-                job.phase = Phase::Done { output };
-                queue.completed += 1;
-                queue.retain_result(id);
+        if matches!(&finish.outcome, Outcome::Done { output } if output.len() > MAX_OUTPUT_BYTES) {
+            return Ok(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        broker.update(|queue| {
+            let job = queue.jobs.get_mut(&id).expect("leased job exists");
+            job.last_finish = Some(FinishReceipt {
+                lease_id: finish.lease_id,
+                done: matches!(finish.outcome, Outcome::Done { .. }),
+            });
+            match finish.outcome {
+                Outcome::Done { output } => {
+                    job.phase = Phase::Done { output };
+                    queue.completed += 1;
+                    queue.retain_result(id);
+                }
+                Outcome::Retry => queue.retry(id),
             }
-            _ => queue.retry(id),
         })?;
         Ok(StatusCode::NO_CONTENT)
     }).await
