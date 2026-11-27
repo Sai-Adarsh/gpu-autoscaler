@@ -44,7 +44,9 @@ Only one broker can open a state file. Keep the directory private because snapsh
 
 The durable broker admits one request at a time. Requests rejected while it is busy return HTTP 503 with `Retry-After: 1` before touching the queue. A write failure before rename returns HTTP 503 and leaves the committed state intact.
 
-If directory sync fails after rename, the request returns HTTP 500 with the error code `queue_commit_outcome_unknown`. The change may already be in the snapshot. The broker stops processing queue requests until restart. A client timeout can also leave the outcome unknown if the broker has started the mutation. Finish receipts survive restart, so a worker can replay a committed acknowledgement without running inference again. Reconcile unknown submit outcomes before resubmitting because submissions do not carry idempotency keys.
+If directory sync fails after rename, the request returns HTTP 500 with the error code `queue_commit_outcome_unknown`. The change may already be in the snapshot. The broker stops processing queue requests until restart. A client timeout can also leave the outcome unknown if the broker has started the mutation. Finish receipts survive restart, so a worker can replay a committed acknowledgement without running inference again.
+
+Supply an `Idempotency-Key` header on `POST /jobs` to make submission retries safe. On an identical prompt and token budget, a replay returns HTTP 202 and the original job ID. A changed payload returns HTTP 409. Keys accept 1–128 ASCII letters, digits, periods, dashes, or underscores. They are scoped to a broker and live as long as the job record, including across restart with durable storage. Reconcile a timed-out submission without a key before retrying it.
 
 ## Kubernetes deployment
 

@@ -44,6 +44,7 @@ fn running(lease_id: u64, attempts: u8, expires: Instant) -> Job {
         phase: Phase::Running { lease_id, expires },
         attempts,
         last_finish: None,
+        idempotency_key: None,
     }
 }
 
@@ -182,7 +183,7 @@ async fn directory_sync_failure_after_rename_fences_broker_until_restart() {
         replacement.into(),
     );
     let state = shared(broker, None);
-    let failure = submit(State(state.clone()), Json(request()))
+    let failure = submit(State(state.clone()), HeaderMap::new(), Json(request()))
         .await
         .err()
         .unwrap()
@@ -223,7 +224,7 @@ async fn unavailable_storage_preserves_mutation_and_semaphore_backpressure() {
     assert_eq!(blocked.headers()[header::RETRY_AFTER], "1");
     drop(permit);
 
-    let result = submit(State(state.clone()), Json(request()))
+    let result = submit(State(state.clone()), HeaderMap::new(), Json(request()))
         .await
         .err()
         .unwrap()
@@ -232,7 +233,10 @@ async fn unavailable_storage_preserves_mutation_and_semaphore_backpressure() {
     assert!(state.broker.lock().unwrap().queue.jobs.is_empty());
     assert!(!dir.0.join("queue.json.tmp").exists());
     fs::remove_dir(&snapshot).unwrap();
-    let result = submit(State(state), Json(request())).await.ok().unwrap();
+    let result = submit(State(state), HeaderMap::new(), Json(request()))
+        .await
+        .ok()
+        .unwrap();
     assert_eq!(result.status(), StatusCode::ACCEPTED);
     let body = to_bytes(result.into_body(), 4096).await.unwrap();
     assert_eq!(
@@ -282,10 +286,14 @@ async fn validates_finish_before_mutating_active_job_and_caps_queue_admission() 
                     phase: Phase::Pending,
                     attempts: 0,
                     last_finish: None,
+                    idempotency_key: None,
                 },
             );
         }
     }
-    let response = submit(State(state), Json(request())).await.ok().unwrap();
+    let response = submit(State(state), HeaderMap::new(), Json(request()))
+        .await
+        .ok()
+        .unwrap();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
 }
