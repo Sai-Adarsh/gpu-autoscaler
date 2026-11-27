@@ -1,0 +1,127 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: inference
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: token-queue
+  namespace: inference
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: token-queue
+  template:
+    metadata:
+      labels:
+        app: token-queue
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: queue
+          image: portfolio.invalid/inference/gpu-autoscaler:0.1.0
+          args: ["queue"]
+          env:
+            - name: QUEUE_LISTEN
+              value: "0.0.0.0:8080"
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: token-queue
+  namespace: inference
+spec:
+  selector:
+    app: token-queue
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-workers
+  namespace: inference
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: gpu-worker
+  template:
+    metadata:
+      labels:
+        app: gpu-worker
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 110
+      nodeSelector:
+        inference-spot-gpu: "true"
+      tolerations:
+        - key: inference-portfolio/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      initContainers:
+        # A native sidecar stays alive while the Rust worker finishes its active request.
+        - name: model
+          image: ghcr.io/ggml-org/llama.cpp:server-cuda
+          restartPolicy: Always
+          args: ["-m", "/models/model.gguf", "--alias", "worker-model", "--host", "0.0.0.0",
+                 "--port", "8081", "--n-gpu-layers", "all", "--ctx-size", "8192"]
+          ports:
+            - name: inference
+              containerPort: 8081
+          startupProbe:
+            httpGet:
+              path: /health
+              port: inference
+            periodSeconds: 5
+            failureThreshold: 120
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+      containers:
+        - name: worker
+          image: portfolio.invalid/inference/gpu-autoscaler:0.1.0
+          args: ["worker"]
+          env:
+            - name: QUEUE_URL
+              value: "http://token-queue:8080"
+            - name: INFERENCE_URL
+              value: "http://127.0.0.1:8081/v1/chat/completions"
+            - name: INFERENCE_MODEL
+              value: "worker-model"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: inference-models
+            readOnly: true

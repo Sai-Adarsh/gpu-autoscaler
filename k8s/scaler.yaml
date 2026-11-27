@@ -1,0 +1,26 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: gpu-token-backlog
+  namespace: inference
+spec:
+  scaleTargetRef:
+    name: gpu-workers
+  pollingInterval: 10
+  cooldownPeriod: 60
+  minReplicaCount: 0
+  maxReplicaCount: 8
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 60
+  triggers:
+    - type: prometheus
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://gpu-queue-prometheus.inference.svc:9090
+        query: sum(inference_pending_tokens{job="gpu-token-queue"} + inference_inflight_tokens{job="gpu-token-queue"})
+        threshold: "10000"
+        activationThreshold: "0"
+        ignoreNullValues: "false"
