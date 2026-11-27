@@ -1,4 +1,7 @@
 use crate::snapshot::Store;
+#[cfg(test)]
+#[path = "../tests/unit/queue.rs"]
+mod tests;
 use axum::{
     Json, Router,
     extract::{Path, State},

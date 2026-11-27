@@ -4,6 +4,10 @@ use serde::Deserialize;
 use std::time::Duration;
 use tokio::{sync::watch, time::{Instant, sleep, timeout_at}};
 
+#[cfg(test)]
+#[path = "../tests/unit/worker.rs"]
+mod tests;
+
 const FINISH_RETRY_WINDOW: Duration = Duration::from_secs(20);
 
 pub struct Runner {
