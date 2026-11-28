@@ -541,3 +541,54 @@ async fn demo_rejects_invalid_requests_and_finishes_valid_jobs() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn worker_retries_when_upstream_response_exceeds_the_body_limit() {
+    let broker = Broker::new();
+    let _queue = broker.start("queue", None).await;
+    let id = broker.submit("complete").await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let upstream = Router::new().route(
+        "/generate",
+        post({
+            let calls = calls.clone();
+            move || {
+                let calls = calls.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                        return Json(json!({
+                            "choices": [{"message": {"content": "oversized response"}}],
+                            "provider_metadata": "x".repeat(1024 * 1024),
+                        }));
+                    }
+                    Json(json!({"choices": [{"message": {"content": "accepted answer"}}]}))
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let inference_url = format!("http://{}/generate", listener.local_addr().unwrap());
+    let upstream = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let _worker = ChildProcess::start(
+        "worker",
+        &[
+            ("QUEUE_URL", &broker.base),
+            ("INFERENCE_URL", &inference_url),
+            ("INFERENCE_MODEL", "fixture"),
+        ],
+    );
+    let result = timeout(Duration::from_secs(8), async {
+        loop {
+            let result: Value = broker.get(&format!("/jobs/{id}")).await.json().await.unwrap();
+            if result["status"] == "done" || result["status"] == "failed" {
+                break result;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(result, json!({"status": "done", "output": "accepted answer"}));
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    upstream.abort();
+}

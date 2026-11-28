@@ -9,6 +9,7 @@ use tokio::{sync::watch, time::{Instant, sleep, timeout_at}};
 mod tests;
 
 const FINISH_RETRY_WINDOW: Duration = Duration::from_secs(20);
+const MAX_UPSTREAM_RESPONSE_BYTES: usize = 1024 * 1024;
 
 pub struct Runner {
     client: reqwest::Client,
@@ -53,7 +54,22 @@ impl Runner {
         if let Ok(key) = std::env::var("INFERENCE_API_KEY") {
             call = call.bearer_auth(key);
         }
-        let result: Completion = call.send().await?.error_for_status()?.json().await?;
+        let mut response = call.send().await?.error_for_status()?;
+        let too_large = "upstream inference response exceeds 1 MiB";
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_UPSTREAM_RESPONSE_BYTES as u64)
+        {
+            return Err(too_large.into());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if chunk.len() > MAX_UPSTREAM_RESPONSE_BYTES - body.len() {
+                return Err(too_large.into());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let result: Completion = serde_json::from_slice(&body)?;
         Ok(result.choices.into_iter().next().ok_or("no choices")?.message.content)
     }
 }

@@ -27,6 +27,8 @@ QUEUE_URL=http://127.0.0.1:8080 \
   cargo run --locked -- worker
 ```
 
+The worker retries when the upstream response body exceeds 1 MiB or its completion text exceeds 64 KiB.
+
 Set `INFERENCE_API_KEY` if the upstream requires authentication. On SIGTERM the worker stops taking leases, finishes its active job, and sends the result to the queue. If the worker dies, the lease expires after 100 seconds and the broker requeues the job for up to three total attempts. The broker requires the active lease ID when accepting a result, so a worker with an expired lease cannot complete a reassigned job.
 
 During drain and normal operation, the worker retries the same finish payload on connection failures and transient HTTP responses, including a busy `503`. It honors `Retry-After` in seconds and spends at most 20 seconds acknowledging a result, bounded by its remaining lease time. A `409` ends the acknowledgement attempt. When a finish response is lost after the broker applied the result, replaying the same lease and outcome returns `204` without changing job state or counters. A different outcome or output conflicts. Retry receipts are cleared on reassignment, and completion receipts last as long as the retained result (the latest 128 terminal jobs).
